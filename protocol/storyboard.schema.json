@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://market-film.local/protocol/storyboard.v1.schema.json",
+  "title": "Market Film Storyboard v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "campaign", "shots"],
+  "properties": {
+    "version": { "const": "1.0" },
+    "campaign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["product_name", "audience", "objective", "tone", "source_facts"],
+      "properties": {
+        "product_name": { "type": "string", "minLength": 1, "maxLength": 48 },
+        "audience": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "objective": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "tone": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "source_facts": { "type": "array", "items": { "type": "string", "maxLength": 120 }, "maxItems": 8 }
+      }
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "order", "start_seconds", "end_seconds", "label", "kind", "copy", "visual_prompt", "purpose"],
+        "properties": {
+          "id": { "enum": ["hook", "hero", "detail", "cta"] },
+          "order": { "type": "integer", "minimum": 1, "maximum": 4 },
+          "start_seconds": { "type": "number", "minimum": 0, "maximum": 30 },
+          "end_seconds": { "type": "number", "minimum": 0.5, "maximum": 30 },
+          "label": { "type": "string", "minLength": 1, "maxLength": 24 },
+          "kind": { "enum": ["text", "wan"] },
+          "copy": { "type": "string", "minLength": 1, "maxLength": 90 },
+          "voiceover": { "type": "string", "maxLength": 120 },
+          "visual_prompt": { "type": "string", "minLength": 1, "maxLength": 1000 },
+          "purpose": { "type": "string", "minLength": 1, "maxLength": 100 }
+        }
+      }
+    }
+  }
+}

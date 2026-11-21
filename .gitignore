@@ -1,0 +1,17 @@
+/node_modules/
+/dist/
+/.models/
+/storage/
+.venv/
+__pycache__/
+.DS_Store
+*.log
+
+.env
+.env.*
+!.env.example
+.ssh/
+*.pem
+*.key
+*.safetensors
+*.gguf
