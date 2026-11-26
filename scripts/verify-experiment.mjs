@@ -125,6 +125,6 @@ const [b, a] = [pair.baseline, pair.audit];
 console.log(JSON.stringify({
   pair: pair.key, seed: pair.seed, baselineId, auditId, revisionPolicy: audit.revisionPolicy || null, referencePolicy: audit.referencePolicy || null,
   conditioningMatched, clips, final: { sameVideo: compare('video'), sameAudio: compare('audio'), sameSubtitle: compare('subtitle') && compare('vtt') },
-  officialVotes: pair.votes, baseline: { wanCalls: b.wanCalls, wanSeconds: b.wanSeconds, wallSeconds: b.wallSeconds }, audit: { wanCalls: a.wanCalls, wanSeconds: a.wanSeconds, wallSeconds: a.wallSeconds, qwenSeconds: a.qwenSeconds, needsReview: a.needsReview },
+  officialVotes: pair.votes, baseline: { wanCalls: b.wanCalls, wanSeconds: b.wanSeconds, wallSeconds: b.wallSeconds }, audit: { wanCalls: a.wanCalls, wanSeconds: a.wanSeconds, wallSeconds: a.wallSeconds, plannerSeconds: a.plannerSeconds, needsReview: a.needsReview },
   delta: { wanCalls: a.wanCalls - b.wanCalls, wanSeconds: +(a.wanSeconds - b.wanSeconds).toFixed(3), wallSeconds: a.wallSeconds == null || b.wallSeconds == null ? null : +(a.wallSeconds - b.wallSeconds).toFixed(3) },
 }, null, 2));

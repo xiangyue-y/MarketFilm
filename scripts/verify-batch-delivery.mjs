@@ -55,7 +55,7 @@ for (const job of jobs) {
   result.jobs.push({
     id: job.id, name: job.product.name, seed: job.seed, assetId: job.assetId, actualReferenceSha256: sha(actualInput),
     planSource: job.planSource, elapsedMs: job.elapsedMs, queueMs: Date.parse(job.timings.startedAt) - Date.parse(job.timings.queuedAt),
-    wanMs: sum(job.attempts.map((attempt) => attempt.generationMs)), qwenReviewMs: sum(job.attempts.map((attempt) => attempt.reviewMs)),
+    wanMs: sum(job.attempts.map((attempt) => attempt.generationMs)), reviewMs: sum(job.attempts.map((attempt) => attempt.reviewMs)),
     needsReview: job.needsReview, narration: { provider: narration.provider, cues: narration.cues },
     attempts: job.attempts.map(({ shotId, shotAttempt, videoUrl, review }) => ({ shotId, shotAttempt, videoUrl, approved: review.approved, endingState: review.endingCheck?.state })),
     selectedShots: job.selectedShots,

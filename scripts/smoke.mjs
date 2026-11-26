@@ -9,27 +9,41 @@ const statusResponse = await fetch(`${baseUrl}/api/status`);
 assert.equal(statusResponse.status, 200, 'API must be reachable');
 const status = await statusResponse.json();
 assert.equal(status.service.status, 'ready', 'Wan/ComfyUI must be ready');
-assert.equal(status.planner.status, 'ready', 'Qwen3-VL must be ready');
+assert.equal(status.planner.status, 'ready', 'GPT must be ready');
 
 const product = {
   name: '样例随行杯', audience: '城市通勤人群', benefit: '磨砂质感，轻松随行',
   callToAction: '了解产品', tone: '自然日常', hook: '把轻松带在身边',
   prompt: 'A clean product shot with soft daylight and slow camera motion.',
 };
-for (const duration of [7, 15]) {
+for (const duration of [7, 8, 15]) {
   const response = await fetch(`${baseUrl}/api/plan`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ product, duration, strategy: 'daily' }),
   });
   assert.equal(response.status, 200, `${duration}s plan should succeed`);
   const result = await response.json();
-  assert.ok(['qwen3-vl-2b', 'editable_template'].includes(result.source), 'planning must use Qwen or its documented editable fallback');
-  if (result.source === 'editable_template') assert.ok(result.reason, 'fallback should explain why model planning was unavailable');
+  assert.equal(result.source, 'gpt', result.reason || 'planning must use GPT');
+  assert.equal(result.model, status.planner.model);
+  assert.deepEqual(result.visualFallbackShots, [], 'GPT must supply every dynamic shot prompt');
   assert.ok(validate(result.storyboard), 'plan must conform to the storyboard schema');
   assert.ok(result.storyboard.shots.every((shot) => typeof shot.voiceover === 'string' && shot.voiceover.trim()), 'each planned shot should include editable voiceover copy');
   assert.equal(result.storyboard.shots.at(-1).end_seconds, duration);
   const wanShots = result.storyboard.shots.filter((shot) => shot.kind === 'wan');
-  assert.equal(wanShots.length, duration === 15 ? 2 : 1, `${duration}s plan should contain the expected number of generated clips`);
+  assert.equal(wanShots.length, duration === 7 ? 1 : 2, `${duration}s plan should contain the expected number of generated clips`);
+  if (duration === 8) {
+    assert.deepEqual(result.storyboard.shots.map(({ id, start_seconds, end_seconds, kind }) => [id, start_seconds, end_seconds, kind]), [
+      ['hero', 0, 4, 'wan'], ['detail', 4, 6, 'wan'], ['cta', 6, 8, 'text'],
+    ]);
+    const detail = wanShots[1];
+    detail.reference_mode = 'scene';
+    detail.reference_asset_id = '0'.repeat(64);
+    const form = new FormData();
+    form.append('storyboard', JSON.stringify(result.storyboard));
+    form.append('product', JSON.stringify(product));
+    const rejected = await fetch(`${baseUrl}/api/generate`, { method: 'POST', body: form });
+    assert.equal(rejected.status, 400, 'scene generation and a still reference cannot both apply to one shot');
+  }
   if (duration === 15) {
     assert.deepEqual(result.storyboard.shots.map((shot) => shot.id), ['hook', 'hero', 'detail', 'cta']);
     assert.notEqual(wanShots[0].visual_prompt, wanShots[1].visual_prompt, '15s generated shots should have distinct prompts');
@@ -69,4 +83,4 @@ if (pairKey) {
   assert.equal(baseline.experimentKey, audit.experimentKey);
 }
 
-console.log(`Smoke passed: Wan and Qwen ready; 7s/15s plans valid; invalid generation rejected; ${pairKey ? 'matched A/B pair present' : 'no matched A/B pair yet'}.`);
+console.log(`Smoke passed: Wan and ${status.planner.model} (${status.planner.reasoningEffort}) ready; 7s/8s/15s GPT plans valid; invalid generation rejected; ${pairKey ? 'matched A/B pair present' : 'no matched A/B pair yet'}.`);

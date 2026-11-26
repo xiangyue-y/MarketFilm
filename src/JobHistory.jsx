@@ -20,10 +20,10 @@ function HistoryRow({ job, active, onOpen }) {
   const name = job.product?.name || '商品视频';
   const status = job.status === 'completed' ? '已完成' : job.status === 'failed' ? '失败' : job.message || '进行中';
   const mode = job.mode === 'baseline' ? 'baseline' : 'audit';
-  const kind = job.userRevision ? '单镜修改' : mode === 'baseline' ? '单向基线' : '质检闭环';
+  const kind = job.userRevision ? '单镜修改' : job.creativeComparison ? (job.creativeComparison.arm === 'baseline' ? '固定双镜' : '选案版') : mode === 'baseline' ? '单向基线' : '质检闭环';
   const time = new Date(job.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
   return <article className={`history-item ${active ? 'active' : ''} ${job.status}`}>
-    <button type="button" className="history-open" onClick={onOpen} aria-label={`查看${name}，${status}`}>
+    <button type="button" className="history-open" onClick={onOpen} aria-label={`查看${name}，${kind}，${status}`}>
       <span className={`history-mark ${mode}`}><Film size={17} /></span>
       <span className="history-copy">
         <span className="history-copy-top"><strong>{name}</strong><em className={mode}>{kind}</em></span>

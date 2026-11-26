@@ -8,6 +8,9 @@ export const defaultProduct = Object.freeze({
   prompt: 'A commuter’s hand reaches in from the right and grips the matte green tumbler around its middle. The hand lifts the tumbler well above the countertop so a clear gap opens beneath the base, then holds it upright in frame, with the original black lid and matte green body clearly visible.',
 });
 
+export const actionCutSeconds = 8;
+export const isActionCut = (board) => board?.shots.at(-1)?.end_seconds === actionCutSeconds;
+
 function secondsLabel(seconds) {
   const value = Math.max(0, Math.round(seconds));
   return `00:${String(value).padStart(2, '0')}`;

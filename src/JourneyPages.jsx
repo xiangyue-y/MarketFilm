@@ -19,12 +19,13 @@ function TaskLink({ icon: Icon, title, text, onClick }) {
   return <button type="button" className="journey-task-link" onClick={onClick}><span className="section-icon"><Icon size={17} /></span><span><strong>{title}</strong><small>{text}</small></span><ChevronRight size={17} /></button>;
 }
 
-export function ResultPage({ job, voiceVersion, busy, onNavigate, onSource }) {
+export function ResultPage({ job, voiceVersion, busy, onNavigate, onSource, onExperiments }) {
   const output = voiceVersion?.outputs?.['9:16'] || originalOutputs(job)['9:16'];
   const revision = job.userRevision;
+  const creativeLabel = job.creativeComparison && (job.creativeComparison.arm === 'baseline' ? '固定双镜' : `选案版 · ${job.creativeComparison.proposal.title}`);
   if (busy) return <main className="journey-page journey-card journey-progress">
     <span className="section-icon"><LoaderCircle className="spin" size={22} /></span>
-    <h1 tabIndex={-1}>{revision ? `正在修改「${revision.shotLabel}」` : '正在制作广告'}</h1>
+    <h1 tabIndex={-1}>{revision ? `正在修改「${revision.shotLabel}」` : creativeLabel || '正在制作广告'}</h1>
     <p role="status">{job.message}</p>
     <div className="journey-progress-bar"><progress aria-label="生成进度" value={job.progress || 0} max="100" /><strong>{job.progress || 0}%</strong></div>
     <button className="button button-secondary" type="button" onClick={() => onNavigate('process')}><Activity size={16} />查看生成详情</button>
@@ -39,11 +40,16 @@ export function ResultPage({ job, voiceVersion, busy, onNavigate, onSource }) {
       <div className="journey-frame"><Clip output={output} label="广告成片" /></div>
     </section>
     <section className="journey-card journey-result-info">
-      <div><span className="panel-kicker">{revision ? '镜头修改版' : voiceVersion ? '新版配音' : '成片已完成'}</span><h1 tabIndex={-1}>{job.product.name}</h1><p>{job.duration} 秒 · 9:16</p></div>
+      <div>
+        <span className="panel-kicker">{revision ? '镜头修改版' : voiceVersion ? '新版配音' : creativeLabel || '成片已完成'}</span>
+        <h1 tabIndex={-1}>{job.product.name}</h1>
+        <p>{job.duration} 秒 · 9:16{job.model && ` · ${job.model}`}</p>
+      </div>
       {revision && <p className="journey-note">已重做「{revision.shotLabel}」，原版仍可查看。</p>}
       {job.needsReview && <p className="journey-note" role="status">抽样质检有待确认，请观看成片检查效果。</p>}
       <a className="button button-primary" href={output.videoUrl} download={output.fileName || '广告成片.mp4'}><ArrowDownToLine size={17} />下载当前成片</a>
       <div className="journey-task-list">
+        {job.creativeComparison && <TaskLink icon={GitCompareArrows} title="查看创意对照" text="两版都完成后可发起盲评" onClick={onExperiments} />}
         {revision && <TaskLink icon={GitCompareArrows} title="对比修改前后" text="查看这一镜的原片和新版" onClick={() => onNavigate('compare-shot')} />}
         {job.selectedShots?.length > 0 && <TaskLink icon={PencilLine} title="修改某个镜头" text="写下意见，只重做选中的动态镜头" onClick={() => onNavigate('revise')} />}
         <TaskLink icon={AudioLines} title="编辑配音" text="修改口播或换音色，保留画面" onClick={() => onNavigate('narration')} />

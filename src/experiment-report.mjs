@@ -18,6 +18,7 @@ export function experimentMarkdown(pairs, { hourlyRate, now = new Date() } = {})
   const cost = (wan) => rate != null && Number.isFinite(wan) ? `¥${(wan * rate / 3600).toFixed(3)}` : '—';
   const performance = pairs.filter((pair) => pair.method === 'independent');
   const shared = pairs.filter((pair) => pair.method === 'shared-first-round');
+  const creative = pairs.filter((pair) => pair.method === 'creative');
   const sections = [
     '# MarketFilm 对照实验快照',
     `导出时间（UTC）：${at}。含 ${pairs.length} 个对照组。`,
@@ -40,6 +41,38 @@ export function experimentMarkdown(pairs, { hourlyRate, now = new Date() } = {})
         }), n ? `${p.winners.baseline} / ${p.winners.audit} / ${p.winners.tie}` : '待评分'];
       })) : '暂未生成这类对照。',
     ]),
+    ...creative.flatMap((pair) => {
+      const { baseline, audit } = pair;
+      const responses = pair.recallResponses ?? [];
+      return [
+        `## 创意流程对照 · ${pairLabel(pair)}`,
+        `选用提案「${cell(pair.proposal.title)}」。两组使用同一 8 秒结构、参考图、H3 参数、Seed、配音配置与 GPT 质检策略。固定双镜组直接生成分镜，选案组在分镜前从三个创意中选一案。`,
+        `评阅顺序随机。每条先看 2 秒并答续看意愿，然后看全片做自由复述。完成两条复述后才显示确认卖点。`,
+        `确认卖点为「${cell(pair.facts.join('、'))}」。复述准确须覆盖核心信息，允许同义表达。统计分母为已判读人数，两组均保留原始作答和盲评顺序。`,
+        table(['指标', '固定双镜', '选案版'], [
+          ['前两秒愿意续看', ...[baseline, audit].map((arm) => pair.votes ? `${arm.continueCount}/${pair.votes}` : '待盲评')],
+          ['准确复述卖点', ...[baseline, audit].map((arm) => arm.recallGraded ? `${arm.recallCorrect}/${arm.recallGraded}` : '待判读')],
+          ['提案生成（秒）', num(baseline.proposalSeconds), num(audit.proposalSeconds)],
+          ['分镜策划（秒）', num(baseline.storyboardSeconds), num(audit.storyboardSeconds)],
+          ['生成及交付（秒）', num(baseline.afterPlanSeconds), num(audit.afterPlanSeconds)],
+          ['H3 生成含返工（秒）', num(baseline.wanSeconds), num(audit.wanSeconds)],
+          ['返工重拍（次数 / 秒）', ...[baseline, audit].map((arm) => `${num(arm.retries, 0)} / ${num(arm.retrySeconds)}`)],
+          ['返工指令（秒）', num(baseline.rewriteSeconds), num(audit.rewriteSeconds)],
+        ]),
+        '耗时不含排队与用户选案时间。单商品、单 Seed 的成片用于检验这组素材，两版可能受视频生成随机性和观看顺序影响。',
+        '### 逐份作答',
+        responses.length ? table(['回执', '观看位置', '版本', '愿意续看', '卖点复述原文', '判读'], responses.flatMap((review, index) =>
+          review.answers.map((answer, slot) => [
+            index + 1,
+            ['A', 'B'][slot],
+            ({ baseline: '固定双镜', audit: '选案版' })[review.order?.[slot]] ?? '—',
+            ({ yes: '是', no: '否' })[review.continueWatching?.[slot]] ?? '—',
+            cell(answer),
+            ({ correct: '准确', incorrect: '不准确' })[review.grading?.[slot]] ?? '待判读',
+          ])
+        )) : '当前有效回执 0 份。',
+      ];
+    }),
   ];
   return `${sections.join('\n\n')}\n`;
 }

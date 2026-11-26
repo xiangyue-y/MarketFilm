@@ -13,7 +13,7 @@ export async function inspectEnding(ask, { productName, facts, referencePath, fr
     const result = await ask({
       prompt: `Check only the ending sample of a short product video. Compare the images. The required subject is ${productName} (${facts.join('；')}) shown in the reference. In the ending sample: absent = no product visible; partial = only a small clipped or mostly occluded part is visible; deformed = clearly changed geometry; intact = the actual product is recognizable. A recognizable close-up can be intact. Use unclear if you cannot decide. If only a plain desk/counter is visible, choose absent. A hand, wire or shadow alone is not the product. Return state and a single short Chinese observation about the ending image. Do not guess motion, branding, or events outside that image.`,
       imagePaths: [{ path: referencePath, label: 'Reference product', maxEdge: 768 }, { path: frame.path, label: `Ending sample (${frame.time}s)`, maxEdge: 768 }],
-      maxTokens: 175, temperature: 0, schema,
+      maxTokens: 175, schema,
     });
     const observation = clean(result.observation, 260);
     if (!states.includes(result.state) || !observation) throw new Error('结尾检查未返回有效观察。');

@@ -18,10 +18,14 @@ import { makeWanReference, referencePolicy } from './wan-reference.mjs';
 import { applyEndingEvidence, inspectEnding } from './ending-review.mjs';
 import { inspectPersistentMatte } from './matte-framing.mjs';
 import { softMattePolicy } from '../protocol/presentation.mjs';
-import { storyboardToScenes } from '../protocol/storyboard.mjs';
+import { actionCutSeconds, isActionCut, storyboardToScenes } from '../protocol/storyboard.mjs';
 import { createStoryboardPlanner, normalizeProduct, validateBoard } from './storyboard.mjs';
+import { normalizeProposal, proposeCreatives } from './creative-proposals.mjs';
 import { cleanEnglishPrompt, safeText } from './text.mjs';
 import { plannerConfig, wanConfig } from './model-config.mjs';
+import { createPlannerClient } from './planner.mjs';
+import { h3, makeH3Workflow } from './h3-workflow.mjs';
+import { wan14, makeWan14Workflow } from './wan14-workflow.mjs';
 
 const execFile = promisify(execFileCallback);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -34,9 +38,11 @@ const evaluationsRoot = path.join(storageRoot, 'evaluations');
 const assets = createAssetLibrary(assetsRoot);
 const sampleImage = path.join(appRoot, 'public', 'product-tumbler.png');
 const wan = wanConfig();
-const planner = plannerConfig(appRoot);
+const wanModel = 'Wan 2.2 TI2V 5B';
+const creativeModel = { 'h3-ref2va': h3, 'wan-i2v-a14b': wan14 }[process.env.CREATIVE_VIDEO_MODEL];
+const planner = plannerConfig();
+const plannerClient = createPlannerClient(planner);
 const apiPort = Number(process.env.API_PORT || 4188);
-const plannerRequestHeaders = planner.token ? { Authorization: `Bearer ${planner.token}` } : {};
 const comfyUrl = (route) => new URL(route, wan.baseUrl);
 const comfySocketUrl = (clientId) => {
   const url = comfyUrl('ws');
@@ -68,8 +74,8 @@ const pendingJobs = [];
 const runningExports = new Set();
 let activeJob = null;
 let serviceState = { status: 'starting', message: '正在连接 Wan / ComfyUI…', gpu: null, error: null };
-let plannerState = { status: 'checking', message: '检查视觉语言模型…', error: null, model: planner.modelId };
-let plannerProcess = null;
+let creativeServiceState = serviceState;
+let plannerState = { status: 'checking', message: '检查 GPT 接口…', error: null, model: planner.modelId, reasoningEffort: planner.reasoningEffort };
 let plannerBootPromise = null;
 let comfyTunnel = null;
 let workerBootPromise = null;
@@ -120,35 +126,64 @@ function startTunnel() {
   ], { stdio: 'ignore' });
   comfyTunnel.on('error', (error) => {
     serviceState = { ...serviceState, status: 'error', error: error.message, message: 'SSH 隧道启动失败' };
+    creativeServiceState = serviceState;
   });
   comfyTunnel.on('exit', (code) => {
-    if (code !== null && code !== 0 && serviceState.status === 'ready') {
+    if (code !== null && code !== 0 && (serviceState.status === 'ready' || creativeServiceState?.status === 'ready')) {
       serviceState = { ...serviceState, status: 'error', message: 'SSH 隧道已断开', error: `ssh exit ${code}` };
+      creativeServiceState = serviceState;
     }
   });
 }
 
-async function checkWanWorkflow() {
-  const loaders = {
-    UNETLoader: ['unet_name', wan.unet], CLIPLoader: ['clip_name', wan.textEncoder], VAELoader: ['vae_name', wan.vae],
-  };
-  const nodes = [...Object.keys(loaders), 'Wan22ImageToVideoLatent', 'CreateVideo', 'SaveVideo'];
+async function checkVideoWorkflow(loaders, conditioningNode) {
+  const nodes = [...Object.keys(loaders), conditioningNode, 'CreateVideo', 'SaveVideo'];
   const issues = (await Promise.all(nodes.map(async (name) => {
     const response = await fetch(comfyUrl(`object_info/${name}`), { signal: AbortSignal.timeout(8000) });
     if (!response.ok) return `${name}（HTTP ${response.status}）`;
     const node = (await response.json())?.[name];
     if (!node) return `缺少节点 ${name}`;
     if (loaders[name]) {
-      const [input, weight] = loaders[name];
-      if (!node.input?.required?.[input]?.[0]?.includes(weight)) return `缺少权重 ${weight}`;
+      const [input, ...weights] = loaders[name];
+      const missing = weights.filter((weight) => !node.input?.required?.[input]?.[0]?.includes(weight));
+      if (missing.length) return `缺少权重 ${missing.join('、')}`;
     }
     return null;
   }))).filter(Boolean);
   if (issues.length) throw new Error(issues.join('；'));
 }
 
+function checkModel(model) {
+  if (model === h3.name) return checkVideoWorkflow({
+    UNETLoader: ['unet_name', h3.unet],
+    CLIPLoader: ['clip_name', h3.encoder],
+    VAELoader: ['vae_name', h3.videoVae, h3.audioVae],
+    LoraLoaderModelOnly: ['lora_name', h3.lora],
+  }, 'MiniMaxH3ReferenceToVideo');
+  if (model === wan14.name) return checkVideoWorkflow({
+    UNETLoader: ['unet_name', wan14.highNoise, wan14.lowNoise],
+    CLIPLoader: ['clip_name', wan.textEncoder],
+    VAELoader: ['vae_name', wan14.vae],
+  }, 'WanImageToVideo');
+  return checkVideoWorkflow({
+    UNETLoader: ['unet_name', wan.unet],
+    CLIPLoader: ['clip_name', wan.textEncoder],
+    VAELoader: ['vae_name', wan.vae],
+  }, 'Wan22ImageToVideoLatent');
+}
+
+async function modelStatus(model, connection) {
+  try {
+    await checkModel(model);
+    return { ...connection, status: 'ready', message: `${model} 可用`, error: null };
+  } catch (error) {
+    return { ...connection, status: 'error', message: `${model} 未就绪：${error.message}`, error: error.message };
+  }
+}
+
 async function bootComfy() {
   serviceState = { status: 'starting', message: '正在连接 Wan / ComfyUI…', gpu: null, error: null };
+  creativeServiceState = serviceState;
   let gpu = null;
   if (wan.managed && !(await ssh(`curl -fsS --max-time 2 http://127.0.0.1:${wan.remotePort}/system_stats || true`))) {
     gpu = await chooseFreeGpu();
@@ -167,14 +202,14 @@ async function bootComfy() {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const stats = await probeComfy();
     if (stats) {
-      await checkWanWorkflow();
       if (comfyTunnel?.exitCode != null) throw new Error(`SSH 隧道已退出，代码 ${comfyTunnel.exitCode}`);
       const device = stats.devices?.[0];
       const selected = gpu || (device ? { index: device.index, uuid: 'existing', freeMiB: Math.round(device.vram_free / 1048576), utilization: null } : null);
-      serviceState = {
-        status: 'ready', message: 'ComfyUI 可用', gpu: selected,
-        comfyVersion: stats.system?.comfyui_version, device: device?.name || 'Wan 2.2', error: null,
-      };
+      const connection = { gpu: selected, comfyVersion: stats.system?.comfyui_version, device: device?.name || 'ComfyUI' };
+      [serviceState, creativeServiceState] = await Promise.all([
+        modelStatus(wanModel, connection),
+        creativeModel ? modelStatus(creativeModel.name, connection) : null,
+      ]);
       return;
     }
     if (comfyTunnel?.exitCode != null) throw new Error(`SSH 隧道已退出，代码 ${comfyTunnel.exitCode}`);
@@ -186,70 +221,26 @@ async function bootComfy() {
 function startWorkerBoot() {
   if (workerBootPromise) return workerBootPromise;
   workerBootPromise = bootComfy().catch((error) => {
-    serviceState = { status: 'error', message: `Wan 未就绪：${error.message}`, gpu: null, error: error.message };
+    serviceState = { status: 'error', message: `ComfyUI 未就绪：${error.message}`, gpu: null, error: error.message };
+    creativeServiceState = serviceState;
   }).finally(() => { workerBootPromise = null; });
   return workerBootPromise;
 }
 
-async function probePlanner() {
-  try {
-    const response = await fetch(new URL('models', planner.baseUrl), { headers: plannerRequestHeaders, signal: AbortSignal.timeout(2500) });
-    return response.ok && (await response.json()).data?.some((model) => model.id === planner.modelId);
-  } catch {
-    return false;
-  }
-}
-
 function setPlannerState(status, message, error = null) {
-  plannerState = { status, model: planner.modelId, message, error };
+  plannerState = { ...plannerState, status, message, error };
 }
 
 async function startPlanner() {
-  if (await probePlanner()) {
-    setPlannerState('ready', '视觉语言模型可用');
-    return;
-  }
-  if (planner.external) {
-    setPlannerState('error', '请检查 .env 中的 PLANNER_BASE_URL、PLANNER_MODEL_ID 和鉴权。');
-    return;
-  }
-  const files = await Promise.all([planner.modelFile, planner.mmproj].map((file) => fs.stat(file).catch(() => null)));
-  if (files.some((file) => !file?.isFile() || !file.size)) {
-    setPlannerState('missing', '缺少 Qwen3-VL 权重：请按 README 配置模型和 mmproj 文件，或接入已启动的视觉模型服务。');
-    return;
-  }
-  setPlannerState('starting', '正在加载视觉语言模型…');
-  const child = plannerProcess || spawn(planner.binary, [
-    '--model', planner.modelFile, '--mmproj', planner.mmproj, '--host', '127.0.0.1', '--port', String(planner.port),
-    '--ctx-size', '8192', '--parallel', '1', '--n-gpu-layers', planner.gpuLayers, '--alias', planner.modelId, '--jinja',
-  ], { stdio: ['ignore', 'ignore', 'pipe'] });
-  if (!plannerProcess) {
-    plannerProcess = child;
-    let stderr = '';
-    child.stderr.on('data', (data) => { stderr = `${stderr}${data}`.slice(-6000); });
-    child.on('error', (error) => {
-      if (plannerProcess === child) plannerProcess = null;
-      setPlannerState('error', '无法启动 llama-server，请检查 PLANNER_BINARY 或系统 PATH。', error.message);
-    });
-    child.on('exit', (code) => {
-      if (plannerProcess === child) plannerProcess = null;
-      setPlannerState('error', 'llama-server 已退出', stderr.trim().split('\n').slice(-3).join(' ') || `llama-server exit ${code}`);
-    });
-  }
-  for (let attempt = 0; attempt < 90; attempt += 1) {
-    if (plannerProcess !== child) return;
-    if (await probePlanner()) {
-      setPlannerState('ready', '视觉语言模型可用');
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-  if (plannerProcess === child) setPlannerState('error', 'llama-server 未在 90 秒内就绪');
+  if (!planner.token) return setPlannerState('missing', '请在 .env 中设置 PLANNER_API_KEY。');
+  setPlannerState('checking', '检查 GPT 接口…');
+  await plannerClient.probe();
+  setPlannerState('ready', 'GPT 策划与质检已就绪');
 }
 
 function queuePlannerStart() {
   plannerBootPromise ||= startPlanner().catch((error) => {
-    setPlannerState('error', '视觉语言模型不可用', error.message);
+    setPlannerState('error', 'GPT 接口未就绪，请检查服务地址、模型和 API 密钥。', error.message);
   }).finally(() => { plannerBootPromise = null; });
 }
 
@@ -261,19 +252,19 @@ const outputFormats = {
   '16:9': { key: '16x9', width: 1024, height: 576 },
 };
 
-function makeWorkflow({ jobId, uploadedImage, prompt, seed, width = profile.width, height = profile.height, frames = profile.frames, steps = profile.steps }) {
-  const positive = `${prompt} Show the specified action clearly from start to finish in one continuous shot. Keep the product recognizable by its original proportions, material, color and visible details as it moves. Keep the action legible in the frame and any camera movement smooth. Do not add text, logos or watermarks.`;
-  const negative = 'captions, subtitles, watermark, logo, duplicated product, changing product shape, changing color, melting, morphing, unsupported floating objects, deformed object, stuttering, jerky movement, accidental camera shake, abrupt camera motion, cuts, blur, oversharpening';
+function makeWorkflow({ jobId, uploadedImage, prompt, seed, creativeMotion = false, width = profile.width, height = profile.height, frames = profile.frames, steps = profile.steps }) {
+  const positive = creativeMotion ? prompt : `${prompt} Show the specified action clearly from start to finish in one continuous shot. Keep the product recognizable by its original proportions, material, color and visible details as it moves. Keep the action legible in the frame and any camera movement smooth. Do not add text, logos or watermarks.`;
+  const negative = creativeMotion ? 'heavy artifacts, duplicated product, watermark' : 'captions, subtitles, watermark, logo, duplicated product, changing product shape, changing color, melting, morphing, unsupported floating objects, deformed object, stuttering, jerky movement, accidental camera shake, abrupt camera motion, cuts, blur, oversharpening';
   const node = (class_type, inputs) => ({ class_type, inputs });
   return {
     '1': node('UNETLoader', { unet_name: wan.unet, weight_dtype: 'default' }),
     '2': node('CLIPLoader', { clip_name: wan.textEncoder, type: 'wan', device: 'cpu' }),
     '3': node('VAELoader', { vae_name: wan.vae }),
-    '4': node('LoadImage', { image: uploadedImage.name }),
+    ...(uploadedImage ? { '4': node('LoadImage', { image: uploadedImage.name }) } : {}),
     '5': node('CLIPTextEncode', { clip: ['2', 0], text: positive }),
     '6': node('CLIPTextEncode', { clip: ['2', 0], text: negative }),
     '7': node('ModelSamplingSD3', { model: ['1', 0], shift: 8.0 }),
-    '8': node('Wan22ImageToVideoLatent', { vae: ['3', 0], start_image: ['4', 0], width, height, length: frames, batch_size: 1 }),
+    '8': node('Wan22ImageToVideoLatent', { vae: ['3', 0], ...(uploadedImage ? { start_image: ['4', 0] } : {}), width, height, length: frames, batch_size: 1 }),
     '9': node('KSampler', {
       model: ['7', 0],
       seed,
@@ -354,7 +345,7 @@ function subscribeToJob(job, response) {
 async function buildExperimentKey(job) {
   const image = await fs.readFile(job.referencePath);
   const imageHash = crypto.createHash('sha256').update(image).digest('hex');
-  return crypto.createHash('sha256').update(JSON.stringify({ seed: job.seed, profile: job.profile || profile, storyboard: job.storyboard, imageHash, revisionPolicy: job.revisionPolicy, referencePolicy: job.referencePolicy, product: job.referencePolicy ? job.product : undefined, narration: job.narrationEnabled ? (job.narrationEngine ? `${job.narrationEngine}:${job.narrationVoice}` : job.narrationVoice || 'Tingting') : undefined, renderPolicy: job.renderPolicy })).digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify({ seed: job.seed, profile: job.profile || profile, model: job.model && job.model !== wanModel ? job.model : undefined, storyboard: job.storyboard, imageHash, revisionPolicy: job.revisionPolicy, referencePolicy: job.referencePolicy, product: job.referencePolicy ? job.product : undefined, narration: job.narrationEnabled ? (job.narrationEngine ? `${job.narrationEngine}:${job.narrationVoice}` : job.narrationVoice || 'Tingting') : undefined, renderPolicy: job.renderPolicy })).digest('hex');
 }
 
 async function uploadToComfy(imagePath, jobId) {
@@ -364,10 +355,29 @@ async function uploadToComfy(imagePath, jobId) {
   form.append('image', new Blob([image]), `product-${jobId}${ext}`);
   form.append('type', 'input');
   form.append('overwrite', 'true');
-  const response = await fetch(comfyUrl('upload/image'), { method: 'POST', body: form, signal: AbortSignal.timeout(30_000) });
-  const body = await response.json();
-  if (!response.ok || !body.name) throw new Error(`ComfyUI 图片上传失败：${JSON.stringify(body)}`);
+  const body = await readComfy('upload/image', (response) => response.json(), 30_000, { method: 'POST', body: form });
+  if (!body.name) throw new Error(`ComfyUI 图片上传失败：${JSON.stringify(body)}`);
   return body;
+}
+
+async function readComfy(route, read, timeout, options) {
+  for (let attempt = 1; ; attempt += 1) {
+    let response;
+    try {
+      response = await fetch(comfyUrl(route), { ...options, signal: AbortSignal.timeout(timeout) });
+      if (response.ok) return await read(response);
+    } catch (error) {
+      if (attempt === 3 || !['TimeoutError', 'TypeError', 'AbortError'].includes(error.name)) throw error;
+    }
+    if (response && !response.ok) {
+      await response.body?.cancel().catch(() => {});
+      if (attempt === 3 || ![502, 503, 504].includes(response.status)) {
+        throw new Error(`ComfyUI ${route.split('?')[0]}：HTTP ${response.status}`);
+      }
+    }
+    if (wan.sshHost) startTunnel();
+    await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+  }
 }
 
 async function createAspectImage(imagePath, width, height) {
@@ -391,6 +401,21 @@ async function createCard(imagePath, product, kind, outputPath, shot, format) {
   const benefit = safeText(product.benefit, 28) || '日常好物，随心而行';
   const cta = safeText(product.callToAction, 16) || '立即了解';
   const hook = safeText(product.hook, 28) || '让日常，多一点轻松';
+  if (kind === 'action-copy' || kind === 'action-cta') {
+    const padding = Math.round(width * 0.072);
+    const titleSize = Math.round(height * 0.035);
+    const y = Math.round(height * 0.86);
+    const lines = limitLines(wrapText(shot.copy, Math.floor((width - padding * 2) / titleSize)), 2);
+    const title = lines.map((line, index) => `<tspan x="${padding}" dy="${index ? Math.round(titleSize * 1.26) : 0}">${escapeXml(line)}</tspan>`).join('');
+    const svg = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="shade" x2="0" y2="1"><stop offset=".64" stop-color="#101613" stop-opacity="0"/><stop offset="1" stop-color="#101613" stop-opacity=".82"/></linearGradient></defs>
+      <rect width="${width}" height="${height}" fill="url(#shade)"/>
+      ${kind === 'action-cta' ? `<text x="${padding}" y="${y - Math.round(titleSize * 1.3)}" fill="#d9f4c5" font-family="PingFang SC, Noto Sans CJK SC, sans-serif" font-size="${Math.round(titleSize * 0.59)}">${escapeXml(name)}</text>` : ''}
+      <text x="${padding}" y="${y}" fill="white" font-family="PingFang SC, Noto Sans CJK SC, sans-serif" font-size="${titleSize}" font-weight="700">${title}</text>
+    </svg>`);
+    await sharp(svg).png().toFile(outputPath);
+    return;
+  }
   const isIntro = kind === 'intro' || shot?.id === 'hook';
   const isOutro = kind === 'outro' || shot?.id === 'cta';
   const headline = kind === 'overlay' ? (shot?.copy || benefit) : (isOutro ? name : (shot?.copy || hook));
@@ -454,9 +479,12 @@ async function composeAd(job, selectedAttempts, imagePath, finalPath, format = o
     const selectedByShot = new Map(selectedAttempts.map((attempt) => [attempt.shotId, attempt]));
     const segments = [];
     const stillTasks = [];
+    const actionCut = isActionCut(job.storyboard);
+    const cta = actionCut ? job.storyboard.shots.at(-1) : null;
     let detailIndex = 0;
     for (const shot of job.storyboard.shots) {
       const duration = shot.end_seconds - shot.start_seconds;
+      if (actionCut && shot.id === 'cta') continue;
       if (shot.kind === 'text') {
         const image = path.join(temp, `${shot.id}.png`);
         stillTasks.push(createCard(imagePath, job.product, shot.id, image, shot, format));
@@ -464,9 +492,21 @@ async function composeAd(job, selectedAttempts, imagePath, finalPath, format = o
         continue;
       }
       const attempt = selectedByShot.get(shot.id);
-      if (!attempt?.videoUrl) throw new Error(`镜头「${shot.label}」缺少已生成的 Wan 视频。`);
+      if (!attempt?.videoUrl) throw new Error(`镜头「${shot.label}」缺少已生成的视频。`);
       const rawPath = path.join(mediaRoot, path.basename(attempt.videoUrl));
       const overlay = path.join(temp, `${shot.id}-overlay.png`);
+      if (actionCut) {
+        const segment = { type: 'video', shotId: shot.id, duration, rawPath, overlay };
+        stillTasks.push(createCard(imagePath, job.product, 'action-copy', overlay, shot, format));
+        if (shot.id === 'detail') {
+          segment.ctaOffset = duration;
+          segment.duration = cta.end_seconds - shot.start_seconds;
+          segment.ctaOverlay = path.join(temp, 'cta-overlay.png');
+          stillTasks.push(createCard(imagePath, job.product, 'action-cta', segment.ctaOverlay, cta, format));
+        }
+        segments.push(segment);
+        continue;
+      }
       stillTasks.push(createCard(imagePath, job.product, 'overlay', overlay, shot, format));
       const rawSeconds = Math.min(duration, job.profile.frames / 24);
       segments.push({ type: 'video', shotId: shot.id, duration: rawSeconds, rawPath, overlay });
@@ -482,7 +522,9 @@ async function composeAd(job, selectedAttempts, imagePath, finalPath, format = o
       if (!softenMatte) return {};
       const started = Date.now();
       const framing = await Promise.all(segments.filter((segment) => segment.type === 'video').map(async (segment) => {
-        segment.crop = await inspectPersistentMatte(segment.rawPath, job.conditioning, job.profile);
+        if (job.storyboard.shots.find((shot) => shot.id === segment.shotId)?.reference_mode === 'scene') return { shotId: segment.shotId, crop: null };
+        const conditioning = segment.shotId === 'detail' ? job.detailConditioning || job.conditioning : job.conditioning;
+        segment.crop = await inspectPersistentMatte(segment.rawPath, conditioning, job.profile);
         return { shotId: segment.shotId, crop: segment.crop };
       }));
       return { framing, framingMs: Date.now() - started };
@@ -506,6 +548,21 @@ async function composeAd(job, selectedAttempts, imagePath, finalPath, format = o
         inputArgs.push('-loop', '1', '-framerate', '24', '-t', String(segment.duration), '-i', segment.overlay);
         const { crop } = segment;
         const cropFilter = crop ? `crop=${crop.width}:${crop.height}:${crop.left}:${crop.top},setsar=1,` : '';
+        if (actionCut) {
+          const sourceFps = job.profile.fps || 24;
+          const scaleTime = (segment.duration - 1 / 24) * sourceFps / (job.profile.frames - 1);
+          const retime = `settb=AVTB,setpts=${scaleTime}*(PTS-STARTPTS),`;
+          filters.push(`[${videoInput}:v]${cropFilter}${retime}scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=0x141a17,setsar=1,fps=24,trim=duration=${segment.duration},setpts=PTS-STARTPTS[${label}base]`);
+          if (segment.ctaOverlay) {
+            const ctaInput = inputIndex++;
+            inputArgs.push('-loop', '1', '-framerate', '24', '-t', String(segment.duration), '-i', segment.ctaOverlay);
+            filters.push(`[${label}base][${overlayInput}:v]overlay=0:0:shortest=1:enable='lt(t,${segment.ctaOffset})'[${label}detail];[${label}detail][${ctaInput}:v]overlay=0:0:shortest=1:enable='gte(t,${segment.ctaOffset})',format=yuv420p[${label}]`);
+          } else {
+            filters.push(`[${label}base][${overlayInput}:v]overlay=0:0:shortest=1,format=yuv420p[${label}]`);
+          }
+          outputLabels.push(`[${label}]`);
+          continue;
+        }
         const backgroundFilter = crop ? 'boxblur=30:12,eq=brightness=-0.22' : 'boxblur=24:12,eq=brightness=-0.32';
         filters.push(`[${videoInput}:v]${cropFilter}deshake=rx=16:ry=16:edge=mirror,split=2[${label}bgsrc][${label}fgsrc];[${label}bgsrc]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},${backgroundFilter}[${label}bg];[${label}fgsrc]scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2[${label}fg];[${label}bg][${label}fg]overlay=(W-w)/2:(H-h)/2,${format.key === '9x16' && !crop ? `${zoom('min(1+0.0012*on,1.06)')},` : ''}trim=duration=${segment.duration},setsar=1,setpts=PTS-STARTPTS,format=yuv420p[${label}base]`);
         filters.push(`[${label}base][${overlayInput}:v]overlay=0:0:shortest=1,format=yuv420p[${label}]`);
@@ -579,22 +636,23 @@ function primaryOutput(job) {
 }
 
 async function waitForGeneration(job, workflow, clientId, from, to, shotMessage) {
-  const socket = new WebSocket(comfySocketUrl(clientId));
+  const socket = new WebSocket(comfySocketUrl(clientId), { handshakeTimeout: 12_000 });
+  let promptId;
   socket.on('error', () => {});
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('连接 ComfyUI 进度通道超时')), 12_000);
-    socket.once('open', () => { clearTimeout(timer); resolve(); });
-    socket.once('error', (error) => { clearTimeout(timer); reject(error); });
+  await new Promise((resolve) => {
+    socket.once('open', resolve);
+    socket.once('close', resolve);
   });
   socket.on('message', (buffer) => {
     try {
       const event = JSON.parse(buffer.toString());
+      if (!promptId || event.data?.prompt_id !== promptId) return;
       if (event.type === 'progress') {
         const value = Number(event.data?.value || 0);
         const max = Math.max(1, Number(event.data?.max || 1));
-        updateJob(job, { status: 'generating', stage: 'video_generation', progress: Math.max(job.progress, Math.min(to, from + Math.round(value / max * (to - from)))), message: `${shotMessage} · Wan 2.2 ${value}/${max} 步` });
+        updateJob(job, { status: 'generating', stage: 'video_generation', progress: Math.max(job.progress, Math.min(to, from + Math.round(value / max * (to - from)))), message: `${shotMessage} · ${job.model} ${value}/${max} 步` });
       } else if (event.type === 'executing') {
-        updateJob(job, { status: 'generating', stage: 'video_generation', progress: Math.max(job.progress, from), message: `${shotMessage} · Wan 2.2 正在处理镜头…` });
+        updateJob(job, { status: 'generating', stage: 'video_generation', progress: Math.max(job.progress, from), message: `${shotMessage} · ${job.model} 正在处理镜头…` });
       }
     } catch {
       // Ignore non-JSON ComfyUI progress frames.
@@ -609,24 +667,26 @@ async function waitForGeneration(job, workflow, clientId, from, to, shotMessage)
     });
     const body = await response.json();
     if (!response.ok || !body.prompt_id) throw new Error(`ComfyUI 拒绝了工作流：${JSON.stringify(body)}`);
-    const promptId = body.prompt_id;
+    promptId = body.prompt_id;
     updateJob(job, { comfyPromptId: promptId, status: 'generating', stage: 'video_generation', progress: Math.max(from, job.progress), message: '工作流已排队，等待 GPU…' });
 
     const deadline = Date.now() + 30 * 60 * 1000;
     while (Date.now() < deadline) {
-      const historyResponse = await fetch(comfyUrl(`history/${promptId}`), { signal: AbortSignal.timeout(10_000) });
-      const history = await historyResponse.json();
+      const history = await readComfy(`history/${promptId}`, (response) => response.json(), 10_000);
       const item = history[promptId];
       if (item) {
-        if (item.status?.status_str !== 'success') throw new Error(`Wan 工作流失败：${JSON.stringify(item.status || {})}`);
+        if (item.status?.status_str !== 'success') {
+          const failure = item.status?.messages?.find(([type]) => type === 'execution_error')?.[1];
+          throw new Error(`${job.model} 工作流失败：${failure?.node_type || 'ComfyUI'} ${String(failure?.exception_message || item.status?.status_str || '未知错误').trim().slice(0, 500)}`);
+        }
         const result = item.outputs?.['12'] || {};
         const videos = [...(result.videos || []), ...(result.images || []), ...(result.gifs || [])].filter((file) => /\.mp4$/i.test(file.filename || ''));
-        if (!videos.length) throw new Error('Wan 已结束，但 ComfyUI 没有返回视频文件。');
+        if (!videos.length) throw new Error('生成已结束，但 ComfyUI 没有返回视频文件。');
         return videos[0];
       }
       await new Promise((resolve) => setTimeout(resolve, 2200));
     }
-    throw new Error('Wan 视频生成超过 30 分钟，任务已停止等待。');
+    throw new Error('视频生成超过 30 分钟，任务已停止等待。');
   } finally {
     socket.close();
   }
@@ -638,27 +698,35 @@ async function processJob(job) {
   if (!job.storyboard) {
     updateJob(job, { status: 'preparing', stage: 'planning', message: '正在规划商品分镜…' });
     const planStarted = Date.now();
-    const result = await planStoryboard(job.product, job.strategy, job.requestedDuration);
+    const result = await planStoryboard(job.product, job.strategy, job.requestedDuration, job.referencePath, job.model === h3.name);
+    if (job.creativeComparison && (result.source !== 'gpt' || result.visualFallbackShots?.length)) {
+      throw new Error('固定双镜组的 GPT 分镜生成失败。');
+    }
     Object.assign(job, { storyboard: result.storyboard, prompt: result.storyboard.shots.find((shot) => shot.kind === 'wan').visual_prompt, planSource: result.source, planReason: result.reason });
-    await updateJob(job, { experimentKey: await buildExperimentKey(job) });
-    logStage(job, 'system', result.source === 'qwen3-vl-2b' ? 'Qwen 广告分镜已生成' : '已采用分镜模板', Date.now() - planStarted);
+    if (!job.creativeComparison) await updateJob(job, { experimentKey: await buildExperimentKey(job) });
+    logStage(job, 'system', result.source === 'gpt' ? 'GPT 广告分镜已生成' : '已采用分镜模板', Date.now() - planStarted);
   }
+  const detailAssetId = job.storyboard.shots.find((shot) => shot.id === 'detail')?.reference_asset_id;
+  const usesH3 = job.model === h3.name;
+  const usesWan14 = job.model === wan14.name;
   const revision = job.userRevision;
   if (revision) {
-    await updateJob(job, { status: 'revising', stage: 'prompt_revision', progress: 3, currentShotId: revision.shotId, message: 'Qwen 正在把你的意见转成镜头指令…' });
+    await updateJob(job, { status: 'revising', stage: 'prompt_revision', progress: 3, currentShotId: revision.shotId, message: 'GPT 正在把你的意见转成镜头指令…' });
     const rewriteStarted = Date.now();
     const shot = job.storyboard.shots.find((item) => item.id === revision.shotId);
     shot.visual_prompt = await planUserRevision(job, shot);
     await updateJob(job, { userRevision: { ...revision, revisedPrompt: shot.visual_prompt } });
-    logStage(job, 'qwen', '人工返工指令已更新，只将指定镜头交回 Wan', Date.now() - rewriteStarted);
+    logStage(job, 'gpt_revision', '人工返工指令已更新，只重新生成指定镜头', Date.now() - rewriteStarted);
   }
   updateJob(job, { status: 'preparing', stage: 'worker', progress: 4, message: '等待 Wan 生成服务就绪…' });
-  if (serviceState.status !== 'ready') await startWorkerBoot();
-  if (serviceState.status !== 'ready') throw new Error(serviceState.error || 'Wan 服务尚未就绪。');
+  const configuredStatus = () => creativeModel && creativeModel.name === job.model ? creativeServiceState : serviceState;
+  if (configuredStatus().status !== 'ready') await startWorkerBoot();
+  if ((usesH3 || usesWan14) && creativeModel?.name !== job.model) await checkModel(job.model);
+  else if (configuredStatus().status !== 'ready') throw new Error(configuredStatus().error || '视频生成服务尚未就绪。');
   const imagePath = job.referencePath;
   const referenceStarted = Date.now();
-  let framedPath = revision && job.conditioning?.url ? path.join(mediaRoot, path.basename(job.conditioning.url)) : null;
-  if (!framedPath || !await fs.access(framedPath).then(() => true, () => false)) {
+  let framedPath = usesH3 ? imagePath : revision && job.conditioning?.url ? path.join(mediaRoot, path.basename(job.conditioning.url)) : null;
+  if (!usesH3 && (!framedPath || !await fs.access(framedPath).then(() => true, () => false))) {
     const { png, alignment } = await makeWanReference(imagePath, job.profile);
     const referenceName = `${job.id}-wan-reference.png`;
     framedPath = path.join(mediaRoot, referenceName);
@@ -667,7 +735,7 @@ async function processJob(job) {
     const padded = Boolean(top || bottom || left || right);
     updateJob(job, { conditioning: { ...alignment, padded, url: `/media/${referenceName}` }, message: padded ? '已补边保留完整参考图，正在上传…' : '参考图画幅匹配，正在上传…' });
     logStage(job, 'system', padded ? '参考图已适配竖屏，完整保留原图范围' : '参考图与生成画幅一致，无需补边', Date.now() - referenceStarted);
-  } else {
+  } else if (!usesH3) {
     logStage(job, 'system', '沿用原版 Wan 参考帧', Date.now() - referenceStarted);
   }
   const uploaded = await uploadToComfy(framedPath, job.id);
@@ -685,6 +753,27 @@ async function processJob(job) {
     }
     const shotStart = revision ? 12 : 12 + (76 * shotIndex) / videoShots.length;
     const shotWidth = revision ? 76 : 76 / videoShots.length;
+    const separateReference = shot.id === 'detail' && detailAssetId;
+    const shotReferencePath = separateReference ? assets.imagePath(detailAssetId) : imagePath;
+    let shotUpload = shot.reference_mode === 'scene' ? null : uploaded;
+    if (!shotUpload) logStage(job, 'system', `「${shot.label}」从场景描述生成`);
+    if (separateReference && usesH3) {
+      shotUpload = await uploadToComfy(shotReferencePath, `${job.id}-detail`);
+      logStage(job, 'system', '商品特写使用独立参考图');
+    } else if (separateReference) {
+      const previous = job.detailConditioning?.url;
+      let detailPath = previous ? path.join(mediaRoot, path.basename(previous)) : null;
+      if (!detailPath || !await fs.access(detailPath).then(() => true, () => false)) {
+        const { png, alignment } = await makeWanReference(shotReferencePath, job.profile);
+        const name = `${job.id}-detail-reference.png`;
+        detailPath = path.join(mediaRoot, name);
+        await fs.writeFile(detailPath, png);
+        const { top, bottom, left, right } = alignment;
+        await updateJob(job, { detailConditioning: { ...alignment, padded: Boolean(top || bottom || left || right), url: `/media/${name}` } });
+      }
+      shotUpload = await uploadToComfy(detailPath, `${job.id}-detail`);
+      logStage(job, 'system', '商品特写使用独立参考图');
+    }
     let prompt = shot.visual_prompt;
     let selected;
     let decision;
@@ -698,16 +787,16 @@ async function processJob(job) {
       const attemptStart = shotStart + (shotWidth * (shotAttempt - 1)) / maxAttempts;
       const attemptEnd = shotStart + (shotWidth * shotAttempt) / maxAttempts;
       const shotMessage = revision ? `修改「${shot.label}」` : `镜头 ${shotIndex + 1}/${videoShots.length} · ${shot.label}`;
-      updateJob(job, { status: 'generating', stage: 'video_generation', progress: Math.round(attemptStart), currentShotId: shot.id, message: `${shotMessage}：提交 Wan 2.2 生成` });
-      logStage(job, 'wan', `${shotMessage} · Wan 开始生成，第 ${shotAttempt} 次`);
+      updateJob(job, { status: 'generating', stage: 'video_generation', progress: Math.round(attemptStart), currentShotId: shot.id, message: `${shotMessage}：提交 ${job.model} 生成` });
+      logStage(job, 'wan', `${shotMessage} · ${job.model} 开始生成，第 ${shotAttempt} 次`);
       const begin = Date.now();
       try {
-        const workflow = makeWorkflow({ ...job.profile, jobId: key, uploadedImage: uploaded, prompt, seed: attempt.seed });
+        const buildWorkflow = usesH3 ? makeH3Workflow : usesWan14 ? makeWan14Workflow : makeWorkflow;
+        const workflow = buildWorkflow({ ...job.profile, jobId: key, uploadedImage: shotUpload, prompt, seed: attempt.seed, creativeMotion: isActionCut(job.storyboard), textEncoder: wan.textEncoder });
         const output = await waitForGeneration(job, workflow, crypto.randomUUID(), attemptStart, attemptEnd, shotMessage);
         const params = new URLSearchParams({ filename: output.filename, subfolder: output.subfolder || '', type: output.type || 'output' });
-        const videoResponse = await fetch(comfyUrl(`view?${params}`), { signal: AbortSignal.timeout(60_000) });
-        if (!videoResponse.ok) throw new Error(`无法下载 ComfyUI 视频：HTTP ${videoResponse.status}`);
-        await fs.writeFile(rawPath, Buffer.from(await videoResponse.arrayBuffer()));
+        const video = await readComfy(`view?${params}`, (response) => response.arrayBuffer(), 60_000);
+        await fs.writeFile(rawPath, Buffer.from(video));
       } catch (error) {
         attempt.error = error.message;
         if (!selected) throw new Error(`${shotMessage}生成失败：${error.message}`);
@@ -720,33 +809,33 @@ async function processJob(job) {
       if (!selected) selected = attempt;
       logStage(job, 'wan', `${shotMessage}原片可预览，第 ${shotAttempt} 次`, attempt.generationMs);
       if (job.mode === 'baseline') break;
-      updateJob(job, { status: 'reviewing', stage: 'quality_review', progress: Math.round(attemptEnd), currentShotId: shot.id, message: `Qwen 正在质检${shotMessage}…` });
+      updateJob(job, { status: 'reviewing', stage: 'quality_review', progress: Math.round(attemptEnd), currentShotId: shot.id, message: `GPT 正在质检${shotMessage}…` });
       const reviewStarted = Date.now();
-      attempt.review = await reviewGeneratedVideo(job, rawPath, imagePath, key, shot);
+      attempt.review = await reviewGeneratedVideo(job, rawPath, shotReferencePath, key, shot);
       attempt.reviewMs = Date.now() - reviewStarted;
       const review = attempt.review;
-      logStage(job, 'qwen', `${shotMessage}${review.status !== 'completed' ? '质检不可用，需人工检查' : review.approved ? '质检通过' : '质检未通过'}`, attempt.reviewMs);
+      logStage(job, 'gpt_review', `${shotMessage}${review.status !== 'completed' ? '质检不可用，需人工检查' : review.approved ? '质检通过' : '质检未通过'}`, attempt.reviewMs);
       if (shotAttempt > 1) {
         const choice = chooseReviewedAttempt(selected, attempt);
         selected = choice.attempt;
         decision = choice.reason;
-        logStage(job, 'qwen', `${shotMessage} · 返工取舍：${decision}`);
+        logStage(job, 'gpt_revision', `${shotMessage} · 返工取舍：${decision}`);
       }
       if (review.status !== 'completed' || review.approved || shotAttempt === maxAttempts) break;
       if (review.retrySupported === false) {
         decision = '没有足够的可定位证据自动返工，保留首轮，等待人工复核。';
-        logStage(job, 'qwen', `${shotMessage} · ${decision}`);
+        logStage(job, 'gpt_review', `${shotMessage} · ${decision}`);
         break;
       }
-      updateJob(job, { status: 'revising', stage: 'prompt_revision', progress: Math.round(attemptEnd), currentShotId: shot.id, message: `Qwen 正根据${shot.label}可见问题修改指令…` });
+      updateJob(job, { status: 'revising', stage: 'prompt_revision', progress: Math.round(attemptEnd), currentShotId: shot.id, message: `GPT 正根据${shot.label}可见问题修改指令…` });
       const revisionStarted = Date.now();
       try {
         prompt = await revisePrompt(job, attempt);
-        logStage(job, 'qwen', `${shotMessage}返工指令已更新，交回 Wan`, Date.now() - revisionStarted);
+        logStage(job, 'gpt_revision', `${shotMessage}返工指令已更新，重新生成该镜头`, Date.now() - revisionStarted);
       } catch (error) {
         retryFailures.push(`${shot.label}返工指令失败：${error.message}`);
         decision = '未能生成有效返工指令，保留首轮。';
-        logStage(job, 'qwen', `${shotMessage}无法产出返工指令，保留首轮原片`, Date.now() - revisionStarted);
+        logStage(job, 'gpt_revision', `${shotMessage}无法产出返工指令，保留首轮原片`, Date.now() - revisionStarted);
         break;
       }
     }
@@ -784,39 +873,9 @@ async function runQueue() {
   }
 }
 
-function parseModelJson(content) {
-  const text = String(content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start < 0 || end < start) throw new Error('视觉语言模型没有返回 JSON 对象。');
-  return JSON.parse(text.slice(start, end + 1));
-}
-
-async function askPlanner({ system, prompt, imagePaths = [], maxTokens = 1200, temperature = 0.15, schema }) {
-  if (plannerState.status !== 'ready') throw new Error('Qwen3-VL 尚未就绪。');
-  const content = [{ type: 'text', text: prompt }];
-  for (const image of imagePaths) {
-    const { path: imagePath, label, maxEdge = 512 } = typeof image === 'string' ? { path: image } : image;
-    if (label) content.push({ type: 'text', text: label });
-    const buffer = await sharp(imagePath).rotate().resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true }).jpeg().toBuffer();
-    const dataUri = `data:image/jpeg;base64,${buffer.toString('base64')}`;
-    content.push({ type: 'image_url', image_url: { url: dataUri } });
-  }
-  const response = await fetch(new URL('chat/completions', planner.baseUrl), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...plannerRequestHeaders },
-    body: JSON.stringify({
-      model: planner.modelId,
-      messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content }],
-      temperature,
-      max_tokens: maxTokens,
-      response_format: schema ? { type: 'json_schema', json_schema: { name: 'market_film', strict: true, schema } } : { type: 'json_object' },
-    }),
-    signal: AbortSignal.timeout(150_000),
-  });
-  const body = await response.json();
-  if (!response.ok) throw new Error(`Qwen3-VL 请求失败：${JSON.stringify(body).slice(0, 1200)}`);
-  return parseModelJson(body.choices?.[0]?.message?.content);
+async function askPlanner(input) {
+  if (plannerState.status !== 'ready') throw new Error('GPT 策划与质检尚未就绪。');
+  return plannerClient.ask(input);
 }
 
 async function extractReviewFrames(videoPath, jobId, durationSeconds) {
@@ -841,8 +900,8 @@ const reviewResponseSchema = {
     approved: { type: 'boolean' },
     issues: { type: 'array', maxItems: 3, items: { type: 'object', properties: {
       time_seconds: { type: 'number' },
-      category: { enum: ['product_identity', 'prompt_match', 'motion_clarity', 'artifact'] },
-      severity: { enum: ['minor', 'major'] },
+      category: { type: 'string', enum: ['product_identity', 'prompt_match', 'motion_clarity', 'artifact'] },
+      severity: { type: 'string', enum: ['minor', 'major'] },
       evidence: { type: 'string' },
     }, required: reviewIssueKeys, additionalProperties: false } },
     revision_prompt: { type: 'string' },
@@ -851,10 +910,13 @@ const reviewResponseSchema = {
 };
 
 async function reviewGeneratedVideo(job, rawVideoPath, referencePath, attemptKey, shot) {
-  if (plannerState.status !== 'ready') return { status: 'error', reason: '视觉语言模型尚未就绪。', frames: [] };
+  if (plannerState.status !== 'ready') return { status: 'error', model: planner.modelId, reason: 'GPT 尚未就绪。', frames: [] };
   let extracted;
-  try { extracted = await extractReviewFrames(rawVideoPath, attemptKey, job.profile.frames / 24); }
-  catch (error) { return { status: 'error', model: 'Qwen3-VL-2B', reason: `无法抽取质检帧：${error.message}`, frames: [] }; }
+  const segmentEnd = isActionCut(job.storyboard) && shot.id === 'detail' ? job.storyboard.shots.at(-1).end_seconds : shot.end_seconds;
+  const sourceSeconds = job.profile.frames / (job.profile.fps || 24);
+  const visibleSeconds = job.model === wan14.name ? sourceSeconds : Math.min(segmentEnd - shot.start_seconds, sourceSeconds);
+  try { extracted = await extractReviewFrames(rawVideoPath, attemptKey, visibleSeconds); }
+  catch (error) { return { status: 'error', model: planner.modelId, reason: `无法抽取质检帧：${error.message}`, frames: [] }; }
   const timestamps = extracted.frames.map((frame) => frame.time);
   const facts = job.storyboard?.campaign?.source_facts || [job.product.benefit];
   const prompt = `你是独立广告画面质检员。第 1 张图是商品参考图，之后是按时间顺序抽取的“镜头 ${shot.order}：${shot.label}”生成帧（约 ${timestamps.map((time) => time.toFixed(2)).join('、')} 秒）。先查看全部生成帧，再判断商品动作是否从开始发展到可见结果。该镜头要求：${shot.visual_prompt}。已确认商品事实：${facts.join('；')}。只判断图像可见证据。检查商品是否明显变形、变色或替换，镜头是否匹配要求，以及是否有文字乱码、结构损坏或突兀伪影。不要把镜头移动、背景变化或手接近商品当成商品动作已完成。分数为 1 到 5：5 表示优秀且没有实质问题，4 表示只有轻微问题，3 表示明显但有限的问题，1 表示严重失败。动作结果在任一后段帧中清楚可见时，动作清晰度至少为 4。只有发现明确、可定位的问题才写入 issues；没有明确问题必须返回空数组。issues 中的每条证据须指出时间点和画面中实际看到的缺陷，禁止填写泛化或占位文字。同类 minor 问题对应评分最高为 4，major 问题对应评分最高为 2；若评分与问题列表冲突，先复核全部帧再输出。返回 JSON 对象，包含 product_identity_score、prompt_match_score、motion_clarity_score、artifact_score 四个 1-5 整数分数、approved 布尔值、issues 数组（每项含 time_seconds 数值、category 字符串、severity 为 minor 或 major、evidence 字符串）、revision_prompt 字符串。若动作结果不可见，动作清晰度不得高于 2 且 approved 必须为 false。approved 仅在商品外观保持、动作可辨认且无严重伪影时为 true。无法判断的内容不要臆测。`;
@@ -871,7 +933,7 @@ async function reviewGeneratedVideo(job, rawVideoPath, referencePath, attemptKey
     if (result.issues.some((issue) => !Number.isFinite(Number(issue.time_seconds)) || !['minor', 'major'].includes(issue.severity) || typeof issue.category !== 'string' || typeof issue.evidence !== 'string')) throw new Error('质检问题缺少有效等级或可定位的证据。');
     const review = {
       status: 'completed',
-      model: 'Qwen3-VL-2B',
+      model: planner.modelId,
       productIdentityScore: Math.max(1, Math.min(5, Number(result.product_identity_score) || 1)),
       promptMatchScore: Math.max(1, Math.min(5, Number(result.prompt_match_score) || 1)),
       motionClarityScore: Math.max(1, Math.min(5, Number(result.motion_clarity_score) || 1)),
@@ -884,12 +946,13 @@ async function reviewGeneratedVideo(job, rawVideoPath, referencePath, attemptKey
     const endingCheck = await inspectEnding(askPlanner, { productName: job.product.name, facts, referencePath, frame: extracted.frames.at(-1) });
     return applyEndingEvidence(review, endingCheck);
   } catch (error) {
-    return { status: 'error', model: 'Qwen3-VL-2B', reason: error.message, frames: extracted.frames.map((frame) => ({ time: frame.time, url: `/media/${attemptKey}-frames/${path.basename(frame.path)}` })) };
+    return { status: 'error', model: planner.modelId, reason: error.message, frames: extracted.frames.map((frame) => ({ time: frame.time, url: `/media/${attemptKey}-frames/${path.basename(frame.path)}` })) };
   }
 }
 
 async function revisePrompt(job, attempt) {
   const shot = job.storyboard.shots.find((item) => item.id === attempt.shotId);
+  const actionCut = isActionCut(job.storyboard);
   const revision = await askPlanner({
     system: '你是负责按质检证据修改 Wan 图生视频提示词的广告导演。保留原来要展示的明确产品动作和商品身份约束，只针对问题改写。动作不明显时要增强动作幅度和起止状态，不得退化成静止产品图。只返回 JSON，格式严格为 {"prompt":"..."}。prompt 值使用英文，不得添加画面文字或商品事实。',
     prompt: `镜头 ${shot.order}（${shot.label}）：${shot.visual_prompt}\n本次实际指令：${attempt.prompt}\n质检问题：${JSON.stringify(attempt.review.issues)}\n质量分：商品 ${attempt.review.productIdentityScore}/5，匹配 ${attempt.review.promptMatchScore}/5，动作清晰度 ${attempt.review.motionClarityScore}/5，伪影 ${attempt.review.artifactScore}/5\n模型建议：${attempt.review.revisionPrompt || '按上述可观察的问题明确修正动作表现。'}\n商品参考图和 Wan 参数保持不变。保留本镜头具体产品动作，不用文字、光影或背景描述替代动作；加强动作的起点、过程和可见结果。保持商品外观一致、只出现单个主体、排除可见文字和 Logo。返回 {"prompt":"英文提示词"}。`,
@@ -897,9 +960,9 @@ async function revisePrompt(job, attempt) {
     schema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'], additionalProperties: false },
   });
   const value = cleanEnglishPrompt(revision.prompt);
-  if (value.length < 20 || value === cleanEnglishPrompt(attempt.prompt)) throw new Error('Qwen 未返回有效的新英文画面指令，已停止返工。');
+  if (value.length < 20 || value === cleanEnglishPrompt(attempt.prompt)) throw new Error('GPT 未返回有效的新英文画面指令，已停止返工。');
   const guardrail = 'Show one clear, continuous product action with a visible start and end. Keep exactly one product with the same silhouette, color and details as the reference. Do not create readable text, letters, numbers, labels, logos, subtitles or watermarks anywhere in the frame.';
-  return `${value} ${guardrail}`;
+  return actionCut ? value : `${value} ${guardrail}`;
 }
 
 async function planUserRevision(job, shot) {
@@ -912,7 +975,7 @@ async function planUserRevision(job, shot) {
     schema: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'], additionalProperties: false },
   });
   const rewritten = cleanEnglishPrompt(prompt);
-  if (rewritten.length < 20 || rewritten === cleanEnglishPrompt(originalPrompt)) throw new Error('Qwen 未生成有效的新镜头指令，请把修改意见写得更具体后重试。');
+  if (rewritten.length < 20 || rewritten === cleanEnglishPrompt(originalPrompt)) throw new Error('GPT 未生成有效的新镜头指令，请把修改意见写得更具体后重试。');
   return rewritten;
 }
 
@@ -920,6 +983,19 @@ app.use(express.json({ limit: '2mb' }));
 app.use('/media', express.static(mediaRoot, { fallthrough: false, immutable: true, maxAge: '1h' }));
 mountExperiments(app, {
   jobs, mediaRoot, evaluationsRoot, primaryOutput,
+  async renderOpening(file) {
+    const name = `${path.parse(file).name}-blind-opening-2s.mp4`;
+    const output = path.join(mediaRoot, name);
+    if (await fs.access(output).then(() => true, () => false)) return name;
+    const temp = path.join(mediaRoot, `.${crypto.randomUUID()}.mp4`);
+    try {
+      await runFfmpeg(['-y', '-i', path.join(mediaRoot, file), '-t', '2', '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-c:a', 'aac', '-movflags', '+faststart', temp]);
+      await fs.rename(temp, output);
+      return name;
+    } finally {
+      await fs.rm(temp, { force: true });
+    }
+  },
   async renderFirstRound(audit, attempts) {
     if (runningExports.has(audit.id)) return null;
     runningExports.add(audit.id);
@@ -938,7 +1014,9 @@ mountExperiments(app, {
 app.get('/api/status', (_request, response) => {
   response.json({
     service: serviceState,
-    videoModel: 'Wan 2.2 TI2V 5B',
+    videoModel: wanModel,
+    creativeVideoModel: creativeModel?.name || wanModel,
+    creativeService: creativeServiceState || serviceState,
     planner: plannerState,
     narration: narrationStatus(),
     profile,
@@ -1094,11 +1172,34 @@ app.get('/api/jobs/:id/events', (request, response) => {
 app.post('/api/plan', async (request, response) => {
   try {
     const product = normalizeProduct(request.body?.product || request.body);
-    const result = await planStoryboard(product, request.body?.strategy, Number(request.body?.duration) === 15 ? 15 : 7);
-    if (product.creativeGoal && (result.source !== 'qwen3-vl-2b' || result.visualFallbackShots?.length)) {
+    const duration = Number(request.body?.duration);
+    const proposal = request.body?.proposal == null ? null : normalizeProposal(request.body.proposal);
+    if (proposal && duration !== actionCutSeconds) throw new Error('创意提案适用于 8 秒广告。');
+    const asset = duration === actionCutSeconds && request.body?.assetId ? await assets.load(request.body.assetId) : null;
+    if (duration === actionCutSeconds && request.body?.assetId && !asset) throw new Error('所选商品参考图不存在。');
+    const reference = asset ? assets.imagePath(asset.id) : sampleImage;
+    const result = await planStoryboard(product, request.body?.strategy, [15, actionCutSeconds].includes(duration) ? duration : 7, reference, creativeModel === h3, proposal);
+    if (creativeModel === wan14 && isActionCut(result.storyboard)) {
+      for (const shot of result.storyboard.shots) delete shot.reference_mode;
+    }
+    if ((proposal || product.creativeGoal) && (result.source !== 'gpt' || result.visualFallbackShots?.length)) {
       return response.status(502).json({ error: '未能按广告目标生成完整的画面指令。请重试，或清空目标后使用普通分镜。' });
     }
-    return response.json({ ...result, plan: storyboardToScenes(result.storyboard) });
+    return response.json({ ...result, plan: storyboardToScenes(result.storyboard), selectedProposal: proposal });
+  } catch (error) {
+    response.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/creative-proposals', async (request, response) => {
+  try {
+    const product = normalizeProduct(request.body?.product || request.body);
+    const asset = request.body?.assetId ? await assets.load(request.body.assetId) : null;
+    if (request.body?.assetId && !asset) throw new Error('所选商品参考图不存在。');
+    const reference = asset ? assets.imagePath(asset.id) : sampleImage;
+    if (plannerState.status !== 'ready') return response.status(503).json({ error: '创意提案需要先接通 GPT。', planner: plannerState });
+    const result = await proposeCreatives(askPlanner, product, reference);
+    return response.json({ ...result, model: planner.modelId, reasoningEffort: planner.reasoningEffort });
   } catch (error) {
     response.status(400).json({ error: error.message });
   }
@@ -1111,14 +1212,18 @@ function normalizeSeed(value) {
 
 function createJob({ product, storyboard, mode, narrationEnabled, seed, asset, batchId, pairedRunId, strategy, requestedDuration }) {
   const date = new Date().toISOString();
+  const actionCut = isActionCut(storyboard) || (!storyboard && requestedDuration === actionCutSeconds);
+  const model = actionCut ? creativeModel : null;
   return {
     id: crypto.randomUUID(), status: 'queued', stage: 'queued', progress: 0,
     message: pendingJobs.length || activeJob ? '加入 GPU 任务队列…' : '准备制作广告短片…',
     createdAt: date, updatedAt: date, product, storyboard,
     prompt: storyboard?.shots.find((shot) => shot.kind === 'wan')?.visual_prompt,
-    mode, narrationEnabled, narrationVoice, narrationEngine: narrationModelId, revisionPolicy, referencePolicy, renderPolicy: softMattePolicy, seed, profile, logs: [], attempts: [],
+    mode, narrationEnabled, narrationVoice, narrationEngine: narrationModelId, revisionPolicy, referencePolicy, renderPolicy: softMattePolicy, seed,
+    profile: model?.profile || (actionCut ? { ...profile, frames: 97 } : profile),
+    logs: [], attempts: [],
     referencePath: asset ? assets.imagePath(asset.id) : sampleImage, assetId: asset?.id, batchId, pairedRunId, strategy, requestedDuration,
-    model: 'Wan 2.2 TI2V 5B', timings: { queuedAt: date },
+    model: model?.name || wanModel, plannerModel: planner.modelId, timings: { queuedAt: date },
   };
 }
 
@@ -1206,10 +1311,17 @@ app.post('/api/generate', withReferenceUpload, async (request, response) => {
   try {
     const product = normalizeProduct(JSON.parse(request.body.product || '{}'));
     const mode = request.body.mode || 'audit';
-    if (!['baseline', 'audit', 'compare'].includes(mode)) throw new Error('生成策略无效。');
+    if (!['baseline', 'audit', 'compare', 'creative-compare'].includes(mode)) throw new Error('生成策略无效。');
     const storyboard = validateBoard(JSON.parse(request.body.storyboard || 'null'));
+    const chosenService = isActionCut(storyboard) && creativeModel ? creativeServiceState : serviceState;
+    if (creativeModel === wan14 && isActionCut(storyboard) && storyboard.shots.some((shot) => shot.reference_mode === 'scene')) {
+      return response.status(400).json({ error: 'Wan 14B 图生视频需要为每个动态镜头选择起始参考图。' });
+    }
+    if (chosenService.status !== 'ready') return response.status(503).json({ error: chosenService.message });
+    const detailAssetId = storyboard.shots.find((shot) => shot.id === 'detail')?.reference_asset_id;
+    if (detailAssetId && !(await assets.load(detailAssetId))) throw new Error('指定的特写参考图不存在。');
     if (product.creativeGoal && product.creativeGoal !== storyboard.campaign.objective) throw new Error('广告目标已变更，请先更新分镜。');
-    if (mode !== 'baseline' && plannerState.status !== 'ready') return response.status(503).json({ error: '闭环质检模式需要先启动 Qwen3-VL。可切换单模型基线进行测试。', planner: plannerState });
+    if (mode !== 'baseline' && plannerState.status !== 'ready') return response.status(503).json({ error: '闭环质检需要接通 GPT。可切换单模型基线进行测试。', planner: plannerState });
     storyboard.campaign.product_name = product.name;
     storyboard.campaign.audience = product.audience;
     storyboard.campaign.tone = product.tone;
@@ -1219,6 +1331,31 @@ app.post('/api/generate', withReferenceUpload, async (request, response) => {
     const asset = request.file ? (await assets.save(request.file.buffer, request.file.originalname)).asset : await assets.load(request.body.assetId);
     if (request.body.assetId && !asset) throw new Error('选中的素材不存在。');
     const seed = normalizeSeed(request.body.seed);
+    if (mode === 'creative-compare') {
+      if (!isActionCut(storyboard) || creativeModel !== h3 || storyboard.shots.some((shot) => shot.reference_mode || shot.reference_asset_id)) {
+        throw new Error('创意对照需要 H3、8 秒分镜，且所有动态镜头使用同一张商品参考图。');
+      }
+      const proposal = normalizeProposal(JSON.parse(request.body.proposal || 'null'));
+      const strategy = request.body.strategy || 'daily';
+      if (!['daily', 'feature', 'offer'].includes(strategy)) throw new Error('创意类型无效。');
+      const shared = {
+        product, mode: 'audit', narrationEnabled: request.body.narration !== 'false',
+        seed, asset, pairedRunId: crypto.randomUUID(), strategy, requestedDuration: actionCutSeconds,
+      };
+      const baseline = createJob(shared);
+      const treatment = createJob({ ...shared, storyboard });
+      const planning = Object.fromEntries(['proposalMs', 'storyboardMs'].flatMap((key) => {
+        const ms = Number(request.body[key]);
+        return Number.isFinite(ms) && ms > 0 && ms <= 600_000 ? [[key, ms]] : [];
+      }));
+      baseline.creativeComparison = { arm: 'baseline' };
+      treatment.creativeComparison = { arm: 'audit', proposal, ...planning };
+      const key = await buildExperimentKey(baseline);
+      const items = crypto.randomInt(2) ? [baseline, treatment] : [treatment, baseline];
+      for (const job of items) job.experimentKey = key;
+      await queueJobs(items);
+      return response.status(202).json({ job: publicJob(items[0]), jobs: items.map(publicJob) });
+    }
     const modes = mode === 'compare' ? (crypto.randomInt(2) ? ['baseline', 'audit'] : ['audit', 'baseline']) : [mode];
     const pairedRunId = modes.length === 2 ? crypto.randomUUID() : undefined;
     const items = modes.map((strategy) => createJob({ product, storyboard, mode: strategy, narrationEnabled: request.body.narration !== 'false', seed, asset, pairedRunId }));
@@ -1238,7 +1375,8 @@ app.post('/api/jobs/:id/shot-revisions', async (request, response) => {
   if (!shot) return response.status(400).json({ error: '请选择原成片中的一个动态镜头。' });
   const voiceVersion = voiceVersionId && source.narrationVersions?.find((item) => item.id === voiceVersionId);
   if (voiceVersionId && !voiceVersion?.outputs?.['9:16']) return response.status(404).json({ error: '该配音版本没有可用的竖屏成片。' });
-  if (serviceState.status !== 'ready' || plannerState.status !== 'ready') return response.status(503).json({ error: 'Wan 或 Qwen 尚未就绪，请稍后重试。' });
+  const revisionService = creativeModel?.name === source.model ? creativeServiceState : serviceState;
+  if (revisionService?.status !== 'ready' || plannerState.status !== 'ready') return response.status(503).json({ error: '视频生成或 GPT 服务尚未就绪，请稍后重试。' });
   try {
     const sourceOutput = voiceVersion ? voiceVersion.outputs['9:16'] : primaryOutput(source);
     const storyboard = validateBoard(structuredClone(source.storyboard));
@@ -1254,8 +1392,8 @@ app.post('/api/jobs/:id/shot-revisions', async (request, response) => {
     if (voiceVersion) for (const item of storyboard.shots) item.voiceover = voiceVersion.cues.find((cue) => cue.shotId === item.id)?.text || '';
     const job = createJob({ product: structuredClone(source.product), storyboard, mode: 'audit', narrationEnabled: Boolean(voiceVersion || source.narrationEnabled), seed: normalizeSeed(null) });
     Object.assign(job, {
-      referencePath: source.referencePath, assetId: source.assetId, profile: source.profile || profile,
-      conditioning: source.conditioning, referencePolicy: source.referencePolicy, renderPolicy: source.renderPolicy,
+      referencePath: source.referencePath, assetId: source.assetId, profile: source.profile || profile, model: source.model || wanModel,
+      conditioning: source.conditioning, detailConditioning: source.detailConditioning, referencePolicy: source.referencePolicy, renderPolicy: source.renderPolicy,
       narration: voiceVersion || source.narration, narrationVoice: voiceVersion?.voice || source.narrationVoice,
       attempts: originals.filter((attempt) => attempt.shotId !== shotId).map((attempt, index) => ({ ...structuredClone(attempt), number: index + 1, reused: true })),
       userRevision: { sourceJobId: source.id, shotId, shotLabel: shot.label, feedback: safeText(feedback, 300), originalPrompt: original.prompt || shot.visual_prompt, originalClipUrl: original.videoUrl, sourceOutput },
@@ -1287,7 +1425,6 @@ app.listen(apiPort, '127.0.0.1', () => {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     comfyTunnel?.kill('SIGTERM');
-    plannerProcess?.kill('SIGTERM');
     stopNarration();
     process.exit(0);
   });

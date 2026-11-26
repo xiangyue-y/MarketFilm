@@ -5,8 +5,8 @@ import { clockLabel, imageAsset, originalOutputs, StatusDot } from './ui.jsx';
 const workflowSteps = [
   { key: 'prepare', label: '素材与工作流', model: 'STUDIO', description: '校验商品素材，提交 Wan 工作流' },
   { key: 'wan', label: '主镜头生成', model: 'WAN 2.2', description: '在 RTX 3090 上生成商品动作镜头' },
-  { key: 'review', label: '画面质检', model: 'QWEN3-VL', description: '抽取关键帧并检查商品、动作与画质' },
-  { key: 'revision', label: '提示词返工', model: 'QWEN3-VL', description: '根据可定位问题改写镜头指令' },
+  { key: 'review', label: '画面质检', description: '抽取关键帧并检查商品、动作与画质' },
+  { key: 'revision', label: '提示词返工', description: '根据可定位问题改写镜头指令' },
   { key: 'narration', label: '配音与字幕', model: 'Qwen3-TTS', description: '在 Mac 上按分镜生成中文旁白，并同步字幕' },
   { key: 'compose', label: '合成与导出', model: 'FFMPEG', description: '拼接片头、主镜头、细节与 CTA' },
 ];
@@ -112,12 +112,16 @@ export default function ProcessWorkspace({ job }) {
   const selectedStage = stageOverride || workflowSteps.find((step) => getWorkflowStepState(job, step.key) === 'current')?.key
     || (job?.status === 'completed' ? 'compose' : 'prepare');
   const activeStep = workflowSteps.find((step) => step.key === selectedStage) || workflowSteps[0];
+  const reviewModel = review?.model || job?.plannerModel || job?.attempts?.find((attempt) => attempt.review?.model)?.review.model || '质检模型';
+  const revisionModel = job?.plannerModel || reviewModel;
+  const stepModel = (step) => step.key === 'review' ? reviewModel : step.key === 'revision' ? revisionModel : step.key === 'wan' ? job?.model || step.model : step.model;
+  const activeModel = stepModel(activeStep);
   function filteredLogsForStage(stage) {
     return (job?.logs || []).filter((entry) => {
       if (stage === 'prepare') return entry.stage === 'system';
       if (stage === 'wan') return entry.stage === 'wan';
-      if (stage === 'review') return entry.stage === 'qwen' && !entry.message.includes('返工');
-      if (stage === 'revision') return entry.stage === 'qwen' && entry.message.includes('返工');
+      if (stage === 'review') return entry.stage === 'gpt_review' || (entry.stage === 'qwen' && !entry.message.includes('返工'));
+      if (stage === 'revision') return entry.stage === 'gpt_revision' || (entry.stage === 'qwen' && entry.message.includes('返工'));
       if (stage === 'narration') return entry.stage === 'narration';
       return entry.stage === 'ffmpeg';
     });
@@ -199,7 +203,7 @@ export default function ProcessWorkspace({ job }) {
         </div>
       </>}
       {frames.length > 0 && <div className="qc-strip">
-        <div className="qc-strip-heading"><strong><ScanEye size={15} /> 第 {selectedAttempt.number} 次质检抽帧</strong><span>{review?.model || 'Qwen3-VL'}</span></div>
+        <div className="qc-strip-heading"><strong><ScanEye size={15} /> 第 {selectedAttempt.number} 次质检抽帧</strong><span>{reviewModel}</span></div>
         <div className="qc-frame-list">{frames.map((frame) => {
           const issue = review?.issues?.find((item) => Math.abs(Number(item.time_seconds) - frame.time) <= 0.5);
           const shotStart = segments.find((segment) => segment.shotId === selectedAttempt?.shotId && segment.kind === 'ai-video')?.start || 0;
@@ -227,17 +231,17 @@ export default function ProcessWorkspace({ job }) {
       <div className="workflow-list">{workflowSteps.map((step, index) => {
         const state = getWorkflowStepState(job, step.key);
         return <div className="workflow-node" key={step.key}>
-          <WorkflowStep step={{ ...step, index: String(index + 1).padStart(2, '0') }} state={state} active={selectedStage === step.key} duration={stepDuration(step.key)} onClick={() => setSelectedStage(step.key)} />
+          <WorkflowStep step={{ ...step, model: stepModel(step), index: String(index + 1).padStart(2, '0') }} state={state} active={selectedStage === step.key} duration={stepDuration(step.key)} onClick={() => setSelectedStage(step.key)} />
           {index < workflowSteps.length - 1 && <span className={`workflow-link ${state === 'done' ? 'done' : ''}`} />}
         </div>;
       })}</div>
-      {selectedStage === 'wan' && job?.attempts?.some((attempt) => attempt.shotAttempt > 1) && <div className="workflow-loop"><RefreshCw size={14} />Qwen 已根据对应镜头质检结果修改指令并触发返工</div>}
+      {selectedStage === 'wan' && job?.attempts?.some((attempt) => attempt.shotAttempt > 1) && <div className="workflow-loop"><RefreshCw size={14} />{revisionModel} 已根据质检结果修改指令并触发返工</div>}
       <div className="step-inspector">
-        <div className="step-inspector-heading"><span className={`model-label ${activeStep.model.toLowerCase().replaceAll('.', '').replaceAll(' ', '-')}`}>{activeStep.model}</span><strong>{activeStep.label}</strong>{job && <small>{stepDuration(selectedStage)}</small>}</div>
+        <div className="step-inspector-heading"><span className={`model-label ${activeModel.toLowerCase().replaceAll('.', '').replaceAll(' ', '-')}`}>{activeModel}</span><strong>{activeStep.label}</strong>{job && <small>{stepDuration(selectedStage)}</small>}</div>
         {!job ? <p>选择一条运行记录后，可以查看实际模型输入、生成轮次、质检帧和合成结果。</p>
           : selectedStage === 'prepare' ? <div className="inspector-facts"><span>商品<strong>{job.product?.name || '未命名商品'}</strong></span><span>目标受众<strong>{job.product?.audience || '未指定'}</strong></span><span>画幅<strong>{job.profile?.width && job.profile?.height ? `${job.profile.width} × ${job.profile.height}` : '9:16 竖屏'}</strong></span><span>实验 Seed<strong>{job.seed}</strong></span>{job.conditioning && <details className="conditioning-preview"><summary>查看 Wan 实际参考帧</summary><div className="conditioning-images"><figure><img alt="原商品参考图" src={job.assetId ? `/api/assets/${job.assetId}/image` : imageAsset}/><figcaption>原图 · {job.conditioning.sourceWidth} × {job.conditioning.sourceHeight}</figcaption></figure><figure><img alt="Wan 实际收到的参考帧" src={job.conditioning.url}/><figcaption>{job.conditioning.padded ? '补边保全画面' : '同比例缩放'} · {job.conditioning.width} × {job.conditioning.height}</figcaption></figure></div></details>}</div>
             : selectedStage === 'wan' ? <div className="attempt-inspector">{(job.attempts || []).map((attempt) => <button key={attempt.number} type="button" aria-pressed={!showingFinal && selectedAttempt?.number === attempt.number} onClick={() => openAttempt(attempt)}>{`镜头 ${attempt.shotOrder || 1} · 第 ${attempt.shotAttempt || attempt.number} 次`}<span>{attempt.reused ? '沿用原片' : attempt.generationMs ? `${(attempt.generationMs / 1000).toFixed(1)} 秒` : attempt.videoUrl ? '已就绪' : attempt.error || '等待中'}</span></button>)}{selectedAttempt?.prompt && <details><summary>本轮画面指令</summary><p>{selectedAttempt.prompt}</p></details>}</div>
-              : selectedStage === 'review' ? review ? <div className="review-inspector">{review.reason && <p>{review.reason}</p>}{review.consistencyWarning && <p className="warning-copy">{review.consistencyWarning}</p>}<span>检查项目：商品身份、指令匹配、动作清晰度、画面伪影</span></div> : <p>{job.mode === 'baseline' ? '基线组跳过 Qwen 质检。' : '质检开始后，这里会显示评分、证据帧和问题定位。'}</p>
+              : selectedStage === 'review' ? review ? <div className="review-inspector">{review.reason && <p>{review.reason}</p>}{review.consistencyWarning && <p className="warning-copy">{review.consistencyWarning}</p>}<span>检查项目：商品身份、指令匹配、动作清晰度、画面伪影</span></div> : <p>{job.mode === 'baseline' ? '基线组跳过画面质检。' : '质检开始后，这里会显示评分、证据帧和问题定位。'}</p>
               : selectedStage === 'revision' ? <div className="revision-inspector">
                 {job.mode === 'baseline' ? <p>单向基线不执行质检返工。</p> : (job.storyboard?.shots || []).filter((shot) => shot.kind === 'wan').map((shot) => {
                   const attempts = (job.attempts || []).filter((attempt) => attempt.shotId === shot.id);

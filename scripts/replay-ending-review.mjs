@@ -1,26 +1,17 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import sharp from 'sharp';
 import { applyEndingEvidence, inspectEnding } from '../server/ending-review.mjs';
 import { chooseReviewedAttempt } from '../server/shot-selection.mjs';
 import { plannerConfig } from '../server/model-config.mjs';
+import { createPlannerClient } from '../server/planner.mjs';
 
-const [id, port] = process.argv.slice(2);
-if (!/^[a-f0-9-]{36}$/.test(id || '') || (port && !/^\d{1,5}$/.test(port))) throw new Error('用法：node --env-file-if-exists=.env scripts/replay-ending-review.mjs <旧质检任务 ID> [Qwen 本机端口]');
-const planner = plannerConfig(process.cwd(), port ? { ...process.env, PLANNER_BASE_URL: '', PLANNER_PORT: port } : process.env);
+const [id, ...extra] = process.argv.slice(2);
+if (!/^[a-f0-9-]{36}$/.test(id || '') || extra.length) throw new Error('用法：node --env-file-if-exists=.env scripts/replay-ending-review.mjs <旧质检任务 ID>');
+const planner = plannerConfig();
+const { ask, probe } = createPlannerClient(planner);
+await probe();
 const storage = path.resolve(process.env.AD_STUDIO_STORAGE || 'storage');
 const job = JSON.parse(await fs.readFile(path.join(storage, 'jobs', `${id}.json`)));
-const ask = async ({ prompt, imagePaths, maxTokens, temperature, schema }) => {
-  const content = [{ type: 'text', text: prompt }];
-  for (const { path: image, label, maxEdge } of imagePaths) {
-    const bytes = await sharp(image).rotate().resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true }).jpeg().toBuffer();
-    content.push({ type: 'text', text: label }, { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${bytes.toString('base64')}` } });
-  }
-  const response = await fetch(new URL('chat/completions', planner.baseUrl), { method: 'POST', headers: { 'content-type': 'application/json', ...(planner.token ? { Authorization: `Bearer ${planner.token}` } : {}) }, body: JSON.stringify({ model: planner.modelId, messages: [{ role: 'user', content }], temperature, max_tokens: maxTokens, response_format: { type: 'json_schema', json_schema: { name: 'market_film', strict: true, schema } } }), signal: AbortSignal.timeout(30_000) });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || `模型响应 ${response.status}`);
-  return JSON.parse(data.choices[0].message.content);
-};
 const attempts = [];
 for (const attempt of job.attempts) {
   const review = attempt.review;

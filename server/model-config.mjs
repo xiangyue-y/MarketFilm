@@ -1,6 +1,3 @@
-import { existsSync } from 'node:fs';
-import path from 'node:path';
-
 function modelUrl(value, key) {
   const url = URL.parse(value);
   if (!url || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
@@ -41,18 +38,11 @@ export function wanConfig(env = process.env) {
   };
 }
 
-export function plannerConfig(root, env = process.env) {
-  const external = Boolean(env.PLANNER_BASE_URL?.trim());
-  const port = external ? undefined : portValue(env.PLANNER_PORT, 18189, 'PLANNER_PORT');
-  const bundledBinary = path.join(root, '.models', 'llama', 'llama-b12560', 'llama-server');
+export function plannerConfig(env = process.env) {
   return {
-    external, port,
-    baseUrl: modelUrl(external ? env.PLANNER_BASE_URL.trim() : `http://127.0.0.1:${port}/v1`, 'PLANNER_BASE_URL'),
-    modelId: env.PLANNER_MODEL_ID || 'qwen3-vl-2b',
-    token: external ? env.PLANNER_API_KEY : undefined,
-    binary: env.PLANNER_BINARY || (existsSync(bundledBinary) ? bundledBinary : 'llama-server'),
-    modelFile: env.PLANNER_MODEL || path.join(root, '.models', 'qwen3-vl', 'Qwen3VL-2B-Instruct-Q4_K_M.gguf'),
-    mmproj: env.PLANNER_MMPROJ || path.join(root, '.models', 'qwen3-vl', 'mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf'),
-    gpuLayers: env.PLANNER_GPU_LAYERS || '99',
+    baseUrl: modelUrl(env.PLANNER_BASE_URL?.trim() || 'https://api.openai.com/v1', 'PLANNER_BASE_URL'),
+    modelId: env.PLANNER_MODEL_ID?.trim() || 'gpt-6.2-sol',
+    reasoningEffort: env.PLANNER_REASONING_EFFORT?.trim() || 'high',
+    token: env.PLANNER_API_KEY?.trim(),
   };
 }

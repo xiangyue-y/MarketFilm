@@ -16,7 +16,8 @@
         "audience": { "type": "string", "minLength": 1, "maxLength": 80 },
         "objective": { "type": "string", "minLength": 1, "maxLength": 120 },
         "tone": { "type": "string", "minLength": 1, "maxLength": 40 },
-        "source_facts": { "type": "array", "items": { "type": "string", "maxLength": 120 }, "maxItems": 8 }
+        "source_facts": { "type": "array", "items": { "type": "string", "maxLength": 120 }, "maxItems": 8 },
+        "creative_concept": { "type": "string", "minLength": 1, "maxLength": 90 }
       }
     },
     "shots": {
@@ -34,6 +35,8 @@
           "end_seconds": { "type": "number", "minimum": 0.5, "maximum": 30 },
           "label": { "type": "string", "minLength": 1, "maxLength": 24 },
           "kind": { "enum": ["text", "wan"] },
+          "reference_asset_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "reference_mode": { "enum": ["scene"] },
           "copy": { "type": "string", "minLength": 1, "maxLength": 90 },
           "voiceover": { "type": "string", "maxLength": 120 },
           "visual_prompt": { "type": "string", "minLength": 1, "maxLength": 1000 },
